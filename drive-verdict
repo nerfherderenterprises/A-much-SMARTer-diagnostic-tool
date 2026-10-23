@@ -1,0 +1,128 @@
+#!/bin/bash
+# drive-verdict — plain-English hard-drive health check
+#
+#   run it:   sudo drive-verdict          (checks /dev/sda by default)
+#             sudo drive-verdict /dev/sdb (or name the drive)
+#
+# It reads the drive's own built-in health report (SMART), prints the full
+# technical report first, then a plain-English verdict at the END. A tech
+# reads the top; everyone else scrolls to the color. One run, both audiences —
+# nobody has to run a second diagnostic to find the issue.
+#
+#   green   = healthy
+#   yellow  = tired / old — works fine, but back it up soon
+#   red     = something is wrong on the disk surface — back up NOW
+#
+# This is meant to be runnable by anyone, alone, with no expert on hand, so
+# it prints the full report first (for a technician) and a plain-English
+# verdict at the end (for everyone else) — no raw numbers to interpret.
+
+set -u
+
+DISK="${1:-/dev/sda}"
+
+# colors, but only when actually on a terminal (so piping to a file stays clean)
+if [ -t 1 ]; then
+  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; N=$'\033[0m'
+else
+  G=""; Y=""; R=""; B=""; N=""
+fi
+
+# ---------------------------------------------------------------------------
+# get the health data (needs root, because the drive's report is protected)
+# ---------------------------------------------------------------------------
+if [ -n "${DRIVE_VERDICT_FILE:-}" ]; then
+  # debug hook: read a saved report instead of a real drive (used for testing)
+  SMART="$(cat "$DRIVE_VERDICT_FILE")"
+  OVERALL="PASSED"
+else
+  if [ ! -b "$DISK" ]; then
+    echo "${R}There is no drive called $DISK.${N}"
+    echo "List the drives that do exist with:   lsblk -d -o NAME,SIZE,MODEL"
+    exit 2
+  fi
+  if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+    echo "${Y}I need root permission to read the drive's health report.${N}"
+    echo "Please run it as:   ${B}sudo drive-verdict${N}"
+    exit 2
+  fi
+  SMART="$(sudo smartctl -a "$DISK" 2>/dev/null)"
+  OVERALL="$(sudo smartctl -H "$DISK" 2>/dev/null | grep -oE 'PASSED|FAILED')"
+  OVERALL="${OVERALL:-UNKNOWN}"
+fi
+
+if ! echo "$SMART" | grep -qE 'SMART support is: Enabled|START OF READ SMART DATA'; then
+  echo "${Y}$DISK did not return a health report.${N}"
+  echo "(Some USB enclosures block this — the drive can still be perfectly fine.)"
+  echo "If this is an external drive, try a different enclosure or cable, or"
+  echo "connect it directly to a SATA port inside a desktop if you can."
+  exit 3
+fi
+
+# ---------------------------------------------------------------------------
+# pull just the numbers that actually predict trouble
+# ---------------------------------------------------------------------------
+get() { echo "$SMART" | awk -v id="$1" '$1==id {print $10; exit}'; }
+
+REALLOC="$(get 5)"     # Reallocated_Sector_Ct   bad spots already quarantined
+PENDING="$(get 197)"   # Current_Pending_Sector  bad spots waiting to be fixed
+UNCORR="$(get 187)"    # Reported_Uncorrect      spots it could not fix at all
+CRC="$(get 199)"       # UDMA_CRC_Error_Count    cable / connection trouble
+TEMP="$(get 194)"      # Temperature_Celsius
+HOURS="$(get 9)"       # Power_On_Hours
+CYCLES="$(get 12)"     # Power_Cycle_Count
+
+# a missing field just reads as zero
+REALLOC="${REALLOC:-0}"; PENDING="${PENDING:-0}"; UNCORR="${UNCORR:-0}"; CRC="${CRC:-0}"
+TEMP="${TEMP:-?}"; HOURS="${HOURS:-?}"; CYCLES="${CYCLES:-?}"
+
+# ---------------------------------------------------------------------------
+# the full technical report, first — a tech reads this and never needs to run
+# a second diagnostic. It's the drive's own raw SMART dump, unedited.
+# ---------------------------------------------------------------------------
+echo
+echo "${B}===== FULL TECHNICAL REPORT ($DISK) =====${N}"
+echo "$SMART"
+echo "${B}===== END OF REPORT — plain-English verdict below =====${N}"
+
+# ---------------------------------------------------------------------------
+# decide
+# ---------------------------------------------------------------------------
+YEARS="?"
+case "$HOURS" in ''|*[!0-9]*) ;; *) YEARS=$(( HOURS / 8765 )) ;; esac
+
+PROBLEM=""
+[ "$OVERALL" = "FAILED" ] && PROBLEM="the drive's own self-test says FAILED"
+[ "$REALLOC" -gt 0 ] 2>/dev/null && PROBLEM="${PROBLEM:+$PROBLEM; }$REALLOC bad spot(s) already quarantined"
+[ "$PENDING" -gt 0 ] 2>/dev/null && PROBLEM="${PROBLEM:+$PROBLEM; }$PENDING bad spot(s) waiting to be fixed"
+[ "$UNCORR" -gt 0 ] 2>/dev/null && PROBLEM="${PROBLEM:+$UNCORR} unreadable spot(s)"
+
+echo
+if [ -n "$PROBLEM" ]; then
+  echo "${R}${B}VERDICT: SOMETHING IS WRONG — back up now.${N}"
+  echo "  ${R}${PROBLEM}.${N}"
+elif [ "$HOURS" != "?" ] && [ "$HOURS" -gt 40000 ] 2>/dev/null; then
+  echo "${Y}${B}VERDICT: tired but working — back it up soon.${N}"
+  echo "  ${Y}No damage, but this drive has ~$YEARS years of use on it.${N}"
+elif [ "$TEMP" != "?" ] && [ "$TEMP" -gt 50 ] 2>/dev/null; then
+  echo "${Y}${B}VERDICT: healthy, but running hot.${N}"
+  echo "  ${Y}Nothing wrong yet — worth checking airflow.${N}"
+else
+  echo "${G}${B}VERDICT: healthy.${N}"
+  echo "  ${G}No bad spots, nothing failing. This drive is fine.${N}"
+fi
+
+# ---------------------------------------------------------------------------
+# the details, in words, in case you want them
+# ---------------------------------------------------------------------------
+echo
+echo "  ${B}the details${N}  ($DISK)"
+[ "$REALLOC" != "0" ] && echo "   bad spots already handled : $REALLOC   ${R}(want 0)${N}"
+[ "$PENDING" != "0" ] && echo "   bad spots still waiting   : $PENDING   ${R}(want 0)${N}"
+echo "   how long it has been used : $HOURS hours (~$YEARS years)"
+echo "   how many times on/off     : $CYCLES"
+echo "   temperature               : ${TEMP}C"
+[ "$CRC" != "0" ] && echo "   connection errors         : $CRC   ${Y}(want 0 — check the cable)${N}"
+echo
+echo "  ${B}the one rule${N}:  as long as the top two lines stay at 0, the drive is not dying."
+echo
